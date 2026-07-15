@@ -1,38 +1,35 @@
- 7.2                                                                                                  download_arquivos.R                                                                                                           
-from histdata import download_hist_data as dl
-from histdata.api import Platform as P, TimeFrame as TF
-import zipfile
+import yfinance as yf
 import pandas as pd
+import os
 
-# baixa bid
-dl(year='2024', month='6', pair='eurusd', platform=P.NINJA_TRADER, time_frame=TF.TICK_DATA_BID)
+os.makedirs("data/raw", exist_ok=True)
 
-# baixa ask (ano corrigido pra 2024)
-dl(year='2024', month='6', pair='eurusd', platform=P.NINJA_TRADER, time_frame=TF.TICK_DATA_ASK)
+def baixar_e_salvar(ticker, nome_arquivo, period="2y", interval="1h"):
+    df = yf.download(ticker, period=period, interval=interval, auto_adjust=True)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.reset_index()
 
-# extrai bid
-with zipfile.ZipFile("DAT_NT_EURUSD_T_BID_202406.zip", "r") as zip_ref:
-    nome_bid = zip_ref.namelist()[0]
-    zip_ref.extractall(".")
+    # o nome da coluna de data muda dependendo do interval (Date pra diário, Datetime pra intraday)
+    col_data = "Datetime" if "Datetime" in df.columns else "Date"
 
-# extrai ask
-with zipfile.ZipFile("DAT_NT_EURUSD_T_ASK_202406.zip", "r") as zip_ref:
-    nome_ask = zip_ref.namelist()[0]
-    zip_ref.extractall(".")
+    caminho = os.path.join("data/raw", nome_arquivo)
+    df.to_csv(caminho, index=False)
 
-print("Arquivo bid:", nome_bid)
-print("Arquivo ask:", nome_ask)
+    print(f"{ticker} | Linhas: {len(df)} | {df[col_data].min()} até {df[col_data].max()}")
+    print(f"Salvo em: {caminho}")
+    print()
+    return df
 
-# lê os dois
-df_bid = pd.read_csv(nome_bid, sep=";", header=None, names=["timestamp", "bid", "volume_B"])
-df_ask = pd.read_csv(nome_ask, sep=";", header=None, names=["timestamp", "ask", "volume_A"])
+df_vale = baixar_e_salvar("VALE3.SA", "vale3_1h.csv")
+df_ibov = baixar_e_salvar("^BVSP", "ibovespa_1h.csv")
 
-df_bid["timestamp"] = pd.to_datetime(df_bid["timestamp"], format="%Y%m%d %H%M%S%f")
-df_ask["timestamp"] = pd.to_datetime(df_ask["timestamp"], format="%Y%m%d %H%M%S%f")
 
-df = pd.merge(df_bid[["timestamp", "bid","volume_B"]], df_ask[["timestamp", "ask","volume_A"]], on="timestamp", how="outer")
-df = df.sort_values("timestamp")
 
-print(df.head())
+
+
+
+
+
 
 
