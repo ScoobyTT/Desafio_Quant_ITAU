@@ -1,5 +1,6 @@
 import pandas as pd
 import streamlit as st
+import metricas
 
 import core
 
@@ -221,6 +222,24 @@ if "resultado" in st.session_state:
             if resumo.empty:
                 st.info("Histórico insuficiente para simular nenhum período completo.")
             else:
+                
+
+                
+                relatorio = metricas.montar_relatorio_metricas(operacoes, resumo, capital_inicial)
+
+                st.subheader("Métricas de risco/retorno")
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Sharpe", relatorio["sharpe"])
+                m2.metric("Sortino", relatorio["sortino"])
+                m3.metric("Calmar", relatorio["calmar"])
+                m4.metric("Profit Factor", relatorio["profit_factor"])
+
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric("Drawdown Relativo", f"{relatorio['drawdown_relativo_pct']}%")
+                d2.metric("Drawdown Absoluto", f"R$ {relatorio['drawdown_absoluto_rs']:,.2f}")
+                d3.metric("Drawdown Máximo", f"R$ {relatorio['drawdown_maximo_rs']:,.2f}")
+                d4.metric("Taxa de Acerto", f"{relatorio['taxa_acerto_pct']}%")
+                                
                 capital_final_bruto = resumo["capital_apos_periodo"].iloc[-1]
                 total_darf = ir_mensal["darf_a_pagar"].sum() if not ir_mensal.empty else 0.0
                 capital_final_liquido = capital_final_bruto - total_darf
