@@ -1,0 +1,48 @@
+# ambiente virtual
+.venv/
+venv/
+env/
+
+# cache e bytecode Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# dados e artefatos pesados (ajuste conforme o que É vs NÃO É pra versionar)
+*.parquet
+*.csv
+*.tsv
+decisoes.db
+*.db
+/tmp/
+
+# modelos treinados
+*.pkl
+*.joblib
+*.h5
+*.pt
+
+# streamlit
+.streamlit/secrets.toml
+
+# variáveis de ambiente / segredos
+.env
+*.env
+
+# IDE
+.vscode/
+.idea/
+
+# SO
+.DS_Store
+Thumbs.db
+
+# logs
+*.log
+
+dados_b3/raw/
+data/.~lock.*

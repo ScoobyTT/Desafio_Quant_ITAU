@@ -17,6 +17,9 @@ DB_PADRAO = "decisoes.db"
 HORIZONTE_PADRAO = 5  # pregões à frente que o modelo tenta prever
 MERCADO_VISTA = 10    # tipo_mercado da B3 para ações à vista
 
+SSA_JANELA_PADRAO = 60          # pregões olhados para trás para extrair a tendência (SSA)
+SSA_JANELAS_DISPONIVEIS = (20, 60, 126)
+
 # Todos os parâmetros abaixo têm default 0 (custo/imposto desligado). Digite os
 # valores reais na interface do app se quiser considerá-los na simulação.
 # Referências de mercado (não são aplicadas automaticamente, é só consulta):
@@ -41,6 +44,7 @@ FEATURE_COLS = [
     "retorno_1d", "retorno_5d", "retorno_20d",
     "volatilidade_20d", "media_5_sobre_20", "media_20_sobre_60",
     "volume_rel_20d", "amplitude_dia", "rsi_14", "momentum_10d",
+    "ssa_tendencia",
 ]
 
 
@@ -53,6 +57,84 @@ def carregar_dados(caminho: str) -> pd.DataFrame:
     return df
 
 
+def carregar_ibovespa(caminho: str) -> pd.DataFrame:
+    """Lê CSV do Ibovespa (colunas: simbolo, data, abertura, maxima, minima,
+    fechamento, fechamento_ajustado, volume, fonte — formato Yahoo Finance).
+
+    Usa `fechamento_ajustado`. Descarta linhas com abertura/máxima/mínima
+    zeradas (pregão do dia corrente ainda incompleto no momento do download,
+    não um fechamento real).
+    """
+    ibov = pd.read_csv(caminho, parse_dates=["data"])
+    incompleta = (ibov["abertura"] == 0) & (ibov["maxima"] == 0) & (ibov["minima"] == 0)
+    if incompleta.any():
+        ibov = ibov[~incompleta]
+    return ibov[["data", "fechamento_ajustado"]].rename(
+        columns={"fechamento_ajustado": "fechamento"}
+    ).sort_values("data").reset_index(drop=True)
+
+
+def carregar_selic(caminho: str) -> pd.DataFrame:
+    """Lê o JSON da série SGS/BCB 11 (Selic diária: [{"data":"dd/mm/aaaa","valor":"x.xxxxxx"}]).
+
+    `valor` já vem em percentual ao dia (ex.: "0.024620" = 0,02462%/dia);
+    aqui é convertido para fração decimal (0.0002462).
+    """
+    selic = pd.read_json(caminho)
+    selic["data"] = pd.to_datetime(selic["data"], format="%d/%m/%Y")
+    selic["taxa_diaria"] = selic["valor"].astype(float) / 100
+    return selic[["data", "taxa_diaria"]].sort_values("data").reset_index(drop=True)
+
+
+def preparar_benchmark(resumo: pd.DataFrame, ibovespa: pd.DataFrame, selic: pd.DataFrame) -> pd.DataFrame:
+    """Alinha Ibovespa e Selic às janelas [data_decisao, data_venda_prevista) de cada
+    período do backtest: um retorno de benchmark e um retorno livre de risco por
+    período, na mesma ordem/tamanho de `resumo` (uso direto em `calcular_metricas`).
+
+    O período final, se não tiver `data_venda_prevista` (a simulação terminou antes
+    do horizonte se completar), fica com NaN nas duas colunas.
+    """
+    linhas = resumo[["data_decisao", "data_venda_prevista"]].copy()
+    linhas["data_decisao"] = pd.to_datetime(linhas["data_decisao"]).astype("datetime64[ns]")
+    linhas["data_venda_prevista"] = pd.to_datetime(linhas["data_venda_prevista"]).astype("datetime64[ns]")
+
+    ibov = ibovespa.sort_values("data").copy()
+    ibov["data"] = pd.to_datetime(ibov["data"]).astype("datetime64[ns]")
+    preco_decisao = pd.merge_asof(
+        linhas[["data_decisao"]].rename(columns={"data_decisao": "data"}), ibov, on="data", direction="backward",
+    )["fechamento"]
+    preco_venda = pd.merge_asof(
+        linhas[["data_venda_prevista"]].rename(columns={"data_venda_prevista": "data"}), ibov, on="data", direction="backward",
+    )["fechamento"]
+    retorno_benchmark = (preco_venda.to_numpy() / preco_decisao.to_numpy() - 1)
+
+    taxas = selic.set_index("data")["taxa_diaria"]
+    retorno_livre_risco = []
+    for _, row in linhas.iterrows():
+        if pd.isna(row["data_venda_prevista"]):
+            retorno_livre_risco.append(np.nan)
+            continue
+        janela = taxas[(taxas.index >= row["data_decisao"]) & (taxas.index < row["data_venda_prevista"])]
+        retorno_livre_risco.append(float(np.prod(1 + janela.to_numpy()) - 1) if len(janela) > 0 else np.nan)
+
+    return pd.DataFrame({"retorno_benchmark": retorno_benchmark, "retorno_livre_risco": retorno_livre_risco})
+
+
+def _ssa_ultimo_ponto(precos: np.ndarray) -> float:
+    """Tendência (1º componente do SSA) no último pregão da janela recebida.
+
+    Reconstrução via SVD da matriz trajetória (Hankel) usando só o
+    autovetor de maior autovalor. O último ponto da janela corresponde a
+    uma única célula da matriz reconstruída (não precisa de diagonal
+    averaging), então o cálculo é direto: S[0] * U[-1,0] * Vt[0,-1].
+    Não olha nada fora da janela recebida (uso causal via `.rolling`).
+    """
+    l = len(precos) // 2
+    trajetoria = np.lib.stride_tricks.sliding_window_view(precos, l).T  # (l, k)
+    U, S, Vt = np.linalg.svd(trajetoria, full_matrices=False)
+    return S[0] * U[-1, 0] * Vt[0, -1]
+
+
 def _rsi(precos: pd.Series, periodo: int = 14) -> pd.Series:
     delta = precos.diff()
     ganho = delta.clip(lower=0).rolling(periodo).mean()
@@ -61,7 +143,9 @@ def _rsi(precos: pd.Series, periodo: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
-def construir_features(df: pd.DataFrame, horizonte: int = HORIZONTE_PADRAO) -> pd.DataFrame:
+def construir_features(
+    df: pd.DataFrame, horizonte: int = HORIZONTE_PADRAO, ssa_janela: int = SSA_JANELA_PADRAO
+) -> pd.DataFrame:
     g = df.groupby("ticker", group_keys=False)
     fechamento = g["preco_fechamento"]
 
@@ -79,6 +163,11 @@ def construir_features(df: pd.DataFrame, horizonte: int = HORIZONTE_PADRAO) -> p
     df["amplitude_dia"] = (df["preco_maximo"] - df["preco_minimo"]) / df["preco_fechamento"]
     df["rsi_14"] = g["preco_fechamento"].transform(_rsi)
     df["momentum_10d"] = fechamento.pct_change(10)
+    # preço atual sobre a tendência SSA da janela: >0 acima da tendência, <0 abaixo
+    ssa_tendencia = g["preco_fechamento"].transform(
+        lambda s: s.rolling(ssa_janela).apply(_ssa_ultimo_ponto, raw=True)
+    )
+    df["ssa_tendencia"] = df["preco_fechamento"] / ssa_tendencia - 1
 
     # alvo: retorno acumulado nos próximos `horizonte` pregões (shift negativo = futuro)
     df["retorno_futuro"] = g["preco_fechamento"].transform(
@@ -124,6 +213,7 @@ def validar_walk_forward(
         acerto_direcao = float(np.mean(np.sign(previsto) == np.sign(real)))
         r2 = float(1 - np.sum((real - previsto) ** 2) / np.sum((real - real.mean()) ** 2))
         resultados.append({
+            "treino_de": pd.Timestamp(datas_treino_seguras.min()).date(),
             "treino_ate": pd.Timestamp(datas_treino_seguras.max()).date(),
             "n_linhas_treino": len(treino),
             "periodo_teste_inicio": pd.Timestamp(datas_teste.min()).date(),
@@ -158,10 +248,12 @@ def _custo_operacional(
     corretagem_fixa: float,
     corretagem_percentual: float,
     iss_pct: float,
-) -> float:
-    """Custo de UMA ponta (compra OU venda): taxa B3 + corretagem (fixa+%) + ISS sobre a corretagem."""
+) -> tuple[float, float]:
+    """Custo de UMA ponta (compra OU venda), decomposto em (emolumentos, corretagem+ISS)."""
+    emolumentos = valor_financeiro * taxa_b3
     corretagem = corretagem_fixa + valor_financeiro * corretagem_percentual
-    return valor_financeiro * taxa_b3 + corretagem + corretagem * iss_pct
+    corretagem_com_iss = corretagem + corretagem * iss_pct
+    return emolumentos, corretagem_com_iss
 
 
 def _alocar_greedy(candidatos: pd.DataFrame, capital_disponivel: float, capital_max_por_acao: float) -> pd.DataFrame:
@@ -213,7 +305,7 @@ def alocar_capital(
         return carteira.assign(custo_estimado=[])
 
     custo_por_ponta = carteira["valor_alocado"].apply(
-        lambda v: _custo_operacional(v, taxa_b3, corretagem_fixa, corretagem_percentual, iss_pct)
+        lambda v: sum(_custo_operacional(v, taxa_b3, corretagem_fixa, corretagem_percentual, iss_pct))
     )
     carteira["custo_estimado"] = (2 * custo_por_ponta).round(2)  # compra + venda
     return carteira
@@ -379,8 +471,11 @@ def backtest(
             preco_venda_real = preco_compra * (1 + ativo["retorno_futuro"])
             valor_venda = ativo["quantidade_acoes"] * preco_venda_real
 
-            custo = _custo_operacional(valor_compra, taxa_b3, corretagem_fixa, corretagem_percentual, iss_pct) + \
-                _custo_operacional(valor_venda, taxa_b3, corretagem_fixa, corretagem_percentual, iss_pct)
+            emol_compra, corr_compra = _custo_operacional(valor_compra, taxa_b3, corretagem_fixa, corretagem_percentual, iss_pct)
+            emol_venda, corr_venda = _custo_operacional(valor_venda, taxa_b3, corretagem_fixa, corretagem_percentual, iss_pct)
+            emolumentos = emol_compra + emol_venda
+            corretagem = corr_compra + corr_venda
+            custo = emolumentos + corretagem
             irrf = valor_venda * irrf_pct
             irrf = irrf if irrf >= IRRF_MINIMO else 0.0
 
@@ -396,6 +491,8 @@ def backtest(
                 "valor_venda": round(valor_venda, 2),
                 "retorno_previsto": round(ativo["retorno_previsto"], 4),
                 "retorno_realizado": round(float(ativo["retorno_futuro"]), 4),
+                "emolumentos": round(emolumentos, 2),
+                "corretagem": round(corretagem, 2),
                 "custo": round(custo, 2),
                 "irrf": round(irrf, 2),
                 "lucro": round(lucro, 2),
@@ -473,3 +570,179 @@ def calcular_ir_mensal(
         })
 
     return pd.DataFrame(linhas)
+
+
+def _intervalo_datas(resumo: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Primeira data_decisao e última data_venda_prevista (ou data_decisao, se a
+    última não tiver venda prevista) do backtest — usado para CAGR e para
+    comparar com buy & hold no mesmo intervalo de calendário."""
+    data_inicio = pd.Timestamp(resumo["data_decisao"].min())
+    datas_venda = pd.to_datetime(resumo["data_venda_prevista"]).dropna()
+    data_fim = datas_venda.max() if not datas_venda.empty else pd.Timestamp(resumo["data_decisao"].max())
+    return data_inicio, data_fim
+
+
+def comparar_buy_and_hold(
+    resumo: pd.DataFrame,
+    capital_inicial: float,
+    ibovespa: pd.DataFrame | None = None,
+    selic: pd.DataFrame | None = None,
+) -> dict:
+    """Quanto o mesmo `capital_inicial` teria virado comprando e segurando o
+    Ibovespa, e aplicando na Selic, no MESMO intervalo de calendário do backtest
+    (primeira decisão até a última venda prevista).
+
+    Valores BRUTOS (sem IR): a regra de IR de swing trade em ações usada em
+    `calcular_ir_mensal` não se aplica a fundos/ETF de índice nem a Tesouro
+    Selic (têm regras próprias, tabela regressiva por prazo), então aplicar o
+    mesmo modelo tributário aqui seria inventar um número. Por isso a
+    comparação abaixo fica no bruto para os três lados: quem quiser o líquido
+    da estratégia de ações, veja `patrimonio_final` em `calcular_metricas`
+    (esse sim líquido de IR) e desconte o IR do Ibovespa/Selic à parte.
+    """
+    if resumo.empty:
+        return {}
+    data_inicio, data_fim = _intervalo_datas(resumo)
+    resultado = {}
+
+    if ibovespa is not None and not ibovespa.empty:
+        ibov = ibovespa.sort_values("data")
+        antes_inicio = ibov.loc[ibov["data"] <= data_inicio, "fechamento"]
+        antes_fim = ibov.loc[ibov["data"] <= data_fim, "fechamento"]
+        if not antes_inicio.empty and not antes_fim.empty:
+            preco_inicio, preco_fim = float(antes_inicio.iloc[-1]), float(antes_fim.iloc[-1])
+            patrimonio = capital_inicial * preco_fim / preco_inicio
+            resultado["ibovespa"] = {
+                "patrimonio_final_bruto": round(patrimonio, 2),
+                "resultado_bruto": round(patrimonio - capital_inicial, 2),
+                "retorno_pct": round(preco_fim / preco_inicio - 1, 4),
+            }
+
+    if selic is not None and not selic.empty:
+        taxas = selic.set_index("data")["taxa_diaria"]
+        janela = taxas[(taxas.index >= data_inicio) & (taxas.index <= data_fim)]
+        if len(janela) > 0:
+            fator = float(np.prod(1 + janela.to_numpy()))
+            patrimonio = capital_inicial * fator
+            resultado["selic"] = {
+                "patrimonio_final_bruto": round(patrimonio, 2),
+                "resultado_bruto": round(patrimonio - capital_inicial, 2),
+                "retorno_pct": round(fator - 1, 4),
+            }
+
+    return resultado
+
+
+def calcular_metricas(
+    resumo: pd.DataFrame,
+    operacoes: pd.DataFrame,
+    capital_inicial: float,
+    horizonte: int,
+    ir_mensal: pd.DataFrame | None = None,
+    risco_livre_anual: float = 0.0,
+    retorno_livre_risco_periodo: pd.Series | None = None,
+    benchmark_retornos: pd.Series | None = None,
+) -> dict:
+    """Métricas de desempenho do backtest completo.
+
+    `resumo`/`operacoes` são as saídas de `backtest()`; `ir_mensal` é a saída
+    de `calcular_ir_mensal()` (opcional; sem ela, `impostos` fica 0).
+
+    A curva de patrimônio usada em drawdown/Sharpe/Sortino/Calmar é a
+    OPERACIONAL (bruta, antes de IR), a mesma de `resumo["capital_apos_periodo"]`,
+    porque o IR é apurado por mês (não por período de `horizonte`) — misturar
+    os dois exigiria redistribuir o IR entre períodos de forma arbitrária.
+    `patrimonio_final` e `resultado_liquido` já descontam o IR total, à parte.
+
+    Sharpe/Sortino anualizam usando 252/`horizonte` períodos por ano (dias úteis
+    padrão da B3). Taxa livre de risco: se `retorno_livre_risco_periodo` for
+    passado (ex.: saída de `preparar_benchmark`, com a Selic real de cada
+    janela), ela é usada período a período; qualquer período faltante (ou se o
+    parâmetro não for passado) cai no escalar `risco_livre_anual` (padrão 0%).
+
+    `benchmark_retornos`: Series com um retorno por linha de `resumo` (mesmo
+    tamanho, mesma ordem), retorno do período de um índice de referência (ex.
+    Ibovespa) nas mesmas janelas de `data_decisao`/`data_venda_prevista`. Sem
+    isso, `beta` e `alfa_jensen_anualizado` ficam None: não existe cálculo de
+    beta/alfa sem uma série de mercado para comparar.
+    """
+    if resumo.empty:
+        return {}
+
+    patrimonio_bruto_final = float(resumo["capital_apos_periodo"].iloc[-1])
+    total_darf = float(ir_mensal["darf_a_pagar"].sum()) if ir_mensal is not None and not ir_mensal.empty else 0.0
+    patrimonio_liquido_final = patrimonio_bruto_final - total_darf
+
+    # curva de patrimônio (bruta): capital inicial + capital_apos_periodo de cada período
+    curva = np.concatenate([[capital_inicial], resumo["capital_apos_periodo"].to_numpy(dtype=float)])
+    pico = np.maximum.accumulate(curva)
+    dd_serie = curva - pico
+    idx_min = int(np.argmin(dd_serie))
+    drawdown_maximo_rs = float(-dd_serie[idx_min])
+    pico_no_ponto = float(pico[idx_min])
+    drawdown_relativo_pct = drawdown_maximo_rs / pico_no_ponto if pico_no_ponto > 0 else np.nan
+    drawdown_absoluto_rs = float(max(0.0, capital_inicial - curva.min()))
+
+    capital_inicio_periodo = curva[:-1]
+    retornos_periodo = resumo["lucro_periodo"].to_numpy(dtype=float) / capital_inicio_periodo
+    periodos_por_ano = 252 / horizonte if horizonte > 0 else np.nan
+    rf_escalar = (1 + risco_livre_anual) ** (1 / periodos_por_ano) - 1 if periodos_por_ano > 0 else 0.0
+    if retorno_livre_risco_periodo is not None and len(retorno_livre_risco_periodo) == len(retornos_periodo):
+        rf_periodo = np.asarray(retorno_livre_risco_periodo, dtype=float)
+        rf_periodo = np.where(np.isnan(rf_periodo), rf_escalar, rf_periodo)
+    else:
+        rf_periodo = np.full(len(retornos_periodo), rf_escalar)
+
+    excesso = retornos_periodo - rf_periodo
+    desvio = retornos_periodo.std(ddof=1) if len(retornos_periodo) > 1 else np.nan
+    sharpe = excesso.mean() / desvio * np.sqrt(periodos_por_ano) if desvio and desvio > 0 else np.nan
+
+    downside = np.clip(excesso, a_min=None, a_max=0)
+    downside_dev = np.sqrt(np.mean(downside ** 2)) if len(downside) > 0 else np.nan
+    sortino = excesso.mean() / downside_dev * np.sqrt(periodos_por_ano) if downside_dev and downside_dev > 0 else np.nan
+
+    data_inicio_bt, data_fim_bt = _intervalo_datas(resumo)
+    anos = max((data_fim_bt - data_inicio_bt).days / 365.25, horizonte / 252)
+    cagr = (patrimonio_bruto_final / capital_inicial) ** (1 / anos) - 1
+    calmar = cagr / drawdown_relativo_pct if drawdown_relativo_pct and drawdown_relativo_pct > 0 else np.nan
+
+    ops_realizadas = operacoes.dropna(subset=["retorno_realizado"]) if not operacoes.empty else operacoes
+    taxa_acerto = float((ops_realizadas["lucro"] > 0).mean()) if not ops_realizadas.empty else np.nan
+    lucro_bruto_ops = ops_realizadas.loc[ops_realizadas["lucro"] > 0, "lucro"].sum() if not ops_realizadas.empty else 0.0
+    prejuizo_bruto_ops = ops_realizadas.loc[ops_realizadas["lucro"] < 0, "lucro"].sum() if not ops_realizadas.empty else 0.0
+    profit_factor = lucro_bruto_ops / abs(prejuizo_bruto_ops) if prejuizo_bruto_ops < 0 else np.nan
+
+    beta = alfa_jensen_anualizado = np.nan
+    if benchmark_retornos is not None and len(benchmark_retornos) == len(retornos_periodo):
+        bench = np.asarray(benchmark_retornos, dtype=float)
+        valido = ~np.isnan(bench)
+        if valido.sum() > 1:
+            variancia_bench = bench[valido].var(ddof=1)
+            if variancia_bench > 0:
+                covariancia = np.cov(retornos_periodo[valido], bench[valido], ddof=1)[0, 1]
+                beta = covariancia / variancia_bench
+                alfa_por_periodo = (retornos_periodo[valido] - rf_periodo[valido]) - beta * (bench[valido] - rf_periodo[valido])
+                alfa_jensen_anualizado = (1 + alfa_por_periodo.mean()) ** periodos_por_ano - 1
+
+    def _ou_none(x: float) -> float | None:
+        return None if x is None or (isinstance(x, float) and np.isnan(x)) else round(float(x), 4)
+
+    return {
+        "capital_inicial": round(capital_inicial, 2),
+        "patrimonio_final": round(patrimonio_liquido_final, 2),
+        "resultado_liquido": round(patrimonio_liquido_final - capital_inicial, 2),
+        "taxa_acerto": _ou_none(taxa_acerto),
+        "alfa_jensen_anualizado": _ou_none(alfa_jensen_anualizado),
+        "beta": _ou_none(beta),
+        "numero_ativos_negociados": int(operacoes["ticker"].nunique()) if not operacoes.empty else 0,
+        "profit_factor": _ou_none(profit_factor),
+        "taxas_e_corretagem": round(float(operacoes["corretagem"].sum()), 2) if "corretagem" in operacoes else 0.0,
+        "emolumentos": round(float(operacoes["emolumentos"].sum()), 2) if "emolumentos" in operacoes else 0.0,
+        "impostos": round(total_darf, 2),
+        "sharpe": _ou_none(sharpe),
+        "sortino": _ou_none(sortino),
+        "calmar": _ou_none(calmar),
+        "drawdown_absoluto_rs": round(drawdown_absoluto_rs, 2),
+        "drawdown_maximo_rs": round(drawdown_maximo_rs, 2),
+        "drawdown_relativo_pct": _ou_none(drawdown_relativo_pct),
+    }

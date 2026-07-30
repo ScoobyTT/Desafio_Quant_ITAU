@@ -16,11 +16,17 @@ st.warning(
 )
 
 arquivo = st.file_uploader("Arquivo processado (parquet ou csv, saída do b3_cotahist.py)", type=["parquet", "csv"])
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 capital = col1.number_input("Capital total (R$)", min_value=0.0, value=100000.0, step=1000.0)
 capital_max_por_acao = col2.number_input("Máximo por ação (R$)", min_value=0.0, value=1000.0, step=100.0)
 horizonte = col3.number_input("Horizonte de previsão (pregões à frente)", min_value=1, value=core.HORIZONTE_PADRAO)
 top_n = col4.number_input("Nº máximo de ativos por período", min_value=1, value=10)
+ssa_janela = col5.selectbox(
+    "Janela do sinal de tendência (SSA)", core.SSA_JANELAS_DISPONIVEIS,
+    index=core.SSA_JANELAS_DISPONIVEIS.index(core.SSA_JANELA_PADRAO),
+    help="Quantos pregões olhar para trás para medir se o preço está acima ou abaixo da "
+         "tendência (Singular Spectrum Analysis). Janela maior = tendência mais suave.",
+)
 
 st.caption(
     "Todos os custos e impostos abaixo começam **zerados**. Preencha com os valores da "
@@ -76,7 +82,7 @@ if arquivo and st.button("Treinar e analisar"):
         with open(caminho, "wb") as f:
             f.write(arquivo.getbuffer())
         df = core.carregar_dados(caminho)
-        df = core.construir_features(df, horizonte=horizonte)
+        df = core.construir_features(df, horizonte=horizonte, ssa_janela=ssa_janela)
         dados_treino = df.dropna(subset=core.FEATURE_COLS + ["retorno_futuro"])
 
     if len(dados_treino) < 500:
@@ -101,6 +107,8 @@ if arquivo and st.button("Treinar e analisar"):
     # disparam um rerun do script, e sem isso o resultado do treino se perderia.
     st.session_state.resultado = dict(
         df=df, validacao=validacao, ranking=ranking, carteira=carteira,
+        treino_de=pd.Timestamp(dados_treino["data_pregao"].min()).date(),
+        treino_ate=pd.Timestamp(dados_treino["data_pregao"].max()).date(),
         capital=capital, capital_max_por_acao=capital_max_por_acao,
         horizonte=int(horizonte), top_n=int(top_n),
         taxa_b3=taxa_b3_pct / 100, corretagem_fixa=corretagem_fixa,
@@ -119,7 +127,15 @@ if "resultado" in st.session_state:
     ])
 
     with aba_carteira:
-        st.subheader(f"Ranking completo ({ranking['data_pregao'].max().date()})")
+        data_decisao_hoje = ranking["data_pregao"].max().date()
+        data_venda_estimada = pd.bdate_range(data_decisao_hoje, periods=r["horizonte"] + 1)[-1].date()
+        st.caption(
+            f"**Janela de treino:** {r['treino_de']} até {r['treino_ate']} (dados usados para ajustar o modelo). "
+            f"**Janela de operação:** decisão em {data_decisao_hoje}, resultado só é conhecido em "
+            f"~{data_venda_estimada} ({r['horizonte']} pregões à frente, estimativa por dias úteis; "
+            "pode variar com feriados)."
+        )
+        st.subheader(f"Ranking completo ({data_decisao_hoje})")
         st.dataframe(
             ranking.rename(columns={"preco_fechamento": "preço", "retorno_previsto": "retorno previsto"}),
             use_container_width=True,
@@ -203,6 +219,17 @@ if "resultado" in st.session_state:
             "retorno **real** que aconteceu (não é hipotético). Pode demorar, pois retreina o "
             "modelo a cada período, sem olhar o futuro em nenhum momento."
         )
+
+        with st.expander("Benchmark (Ibovespa) e taxa livre de risco (Selic) — opcional, para Beta e Alfa de Jensen"):
+            arquivo_ibov = st.file_uploader(
+                "Ibovespa (CSV: simbolo, data, abertura, maxima, minima, fechamento, fechamento_ajustado, volume, fonte)",
+                type=["csv"], key="ibov_upload",
+            )
+            arquivo_selic = st.file_uploader(
+                "Selic (JSON da série SGS/BCB 11: [{\"data\":\"dd/mm/aaaa\",\"valor\":\"x.xxxxxx\"}])",
+                type=["json"], key="selic_upload",
+            )
+
         if st.button("Rodar backtest completo"):
             with st.spinner("Simulando compra e venda ao longo do histórico..."):
                 operacoes, resumo = core.backtest(
@@ -215,43 +242,128 @@ if "resultado" in st.session_state:
                 ir_mensal = core.calcular_ir_mensal(
                     operacoes, ir_aliquota=r["ir_aliquota"], isencao_vendas_mensal=r["isencao_mensal"]
                 )
-                st.session_state.backtest_resultado = (operacoes, resumo, ir_mensal, r["capital"])
+                retorno_livre_risco_periodo = benchmark_retornos = ibov = selic = None
+                if not resumo.empty and arquivo_ibov is not None and arquivo_selic is not None:
+                    caminho_ibov = f"/tmp/{arquivo_ibov.name}"
+                    with open(caminho_ibov, "wb") as f:
+                        f.write(arquivo_ibov.getbuffer())
+                    caminho_selic = f"/tmp/{arquivo_selic.name}"
+                    with open(caminho_selic, "wb") as f:
+                        f.write(arquivo_selic.getbuffer())
+                    ibov = core.carregar_ibovespa(caminho_ibov)
+                    selic = core.carregar_selic(caminho_selic)
+                    bench = core.preparar_benchmark(resumo, ibov, selic)
+                    retorno_livre_risco_periodo = bench["retorno_livre_risco"]
+                    benchmark_retornos = bench["retorno_benchmark"]
+                metricas = core.calcular_metricas(
+                    resumo, operacoes, capital_inicial=r["capital"], horizonte=r["horizonte"], ir_mensal=ir_mensal,
+                    retorno_livre_risco_periodo=retorno_livre_risco_periodo, benchmark_retornos=benchmark_retornos,
+                )
+                comparativo = core.comparar_buy_and_hold(
+                    resumo, capital_inicial=r["capital"], ibovespa=ibov, selic=selic,
+                )
+                st.session_state.backtest_resultado = (operacoes, resumo, ir_mensal, metricas, comparativo, r["capital"])
 
         if "backtest_resultado" in st.session_state:
-            operacoes, resumo, ir_mensal, capital_inicial = st.session_state.backtest_resultado
+            operacoes, resumo, ir_mensal, metricas, comparativo, capital_inicial = st.session_state.backtest_resultado
             if resumo.empty:
                 st.info("Histórico insuficiente para simular nenhum período completo.")
             else:
-                
 
-                
-                relatorio = metricas.montar_relatorio_metricas(operacoes, resumo, capital_inicial)
+                def fmt_pct(v):
+                    return f"{v * 100:.2f}%" if v is not None else "—"
 
-                st.subheader("Métricas de risco/retorno")
+                def fmt_num(v, casas=2):
+                    return f"{v:.{casas}f}" if v is not None else "—"
+
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Sharpe", relatorio["sharpe"])
-                m2.metric("Sortino", relatorio["sortino"])
-                m3.metric("Calmar", relatorio["calmar"])
-                m4.metric("Profit Factor", relatorio["profit_factor"])
+                m1.metric("Capital inicial", fmt_rs(metricas["capital_inicial"]))
+                m2.metric("Patrimônio final (líq. de IR)", fmt_rs(metricas["patrimonio_final"]))
+                m3.metric("Resultado líquido", fmt_rs(metricas["resultado_liquido"]),
+                          fmt_pct(metricas["resultado_liquido"] / metricas["capital_inicial"]))
+                m4.metric("Nº de ativos negociados", metricas["numero_ativos_negociados"])
 
-                d1, d2, d3, d4 = st.columns(4)
-                d1.metric("Drawdown Relativo", f"{relatorio['drawdown_relativo_pct']}%")
-                d2.metric("Drawdown Absoluto", f"R$ {relatorio['drawdown_absoluto_rs']:,.2f}")
-                d3.metric("Drawdown Máximo", f"R$ {relatorio['drawdown_maximo_rs']:,.2f}")
-                d4.metric("Taxa de Acerto", f"{relatorio['taxa_acerto_pct']}%")
-                                
-                capital_final_bruto = resumo["capital_apos_periodo"].iloc[-1]
-                total_darf = ir_mensal["darf_a_pagar"].sum() if not ir_mensal.empty else 0.0
-                capital_final_liquido = capital_final_bruto - total_darf
+                capital_estrategia = resumo.set_index("data_decisao")["capital_apos_periodo"]
+                caminho_ibov = f"/tmp/{arquivo_ibov.name}"
+                caminho_selic = f"/tmp/{arquivo_selic.name}"
+                ibov = core.carregar_ibovespa(caminho_ibov)
+                selic = core.carregar_selic(caminho_selic)    
+                grafico = pd.DataFrame({"Estratégia (ML)": capital_estrategia})
 
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Capital final (antes de IR)", f"R$ {capital_final_bruto:,.2f}",
-                          f"{(capital_final_bruto/capital_inicial-1)*100:.2f}%")
-                m2.metric("DARF total pago no período", f"R$ {total_darf:,.2f}")
-                m3.metric("Capital final (líquido de IR)", f"R$ {capital_final_liquido:,.2f}",
-                          f"{(capital_final_liquido/capital_inicial-1)*100:.2f}%")
+                if ibov is not None and selic is not None:
+                    bench = core.preparar_benchmark(resumo, ibov, selic)
+                    grafico["Ibovespa"] = (
+                        r["capital"] * (1 + bench["retorno_benchmark"].fillna(0)).cumprod()
+                    ).values
+                    grafico["Selic"] = (
+                        r["capital"] * (1 + bench["retorno_livre_risco"].fillna(0)).cumprod()
+                    ).values
 
-                st.line_chart(resumo.set_index("data_decisao")["capital_apos_periodo"])
+                st.line_chart(grafico)
+                #st.line_chart(comparativo.set_index("data_decisao")["carregar_selic"])
+
+                st.subheader("Métricas de risco e retorno")
+                if metricas["beta"] is None:
+                    st.caption(
+                        "Beta e Alfa de Jensen exigem os uploads de Ibovespa e Selic acima (rode o "
+                        "backtest de novo com os dois arquivos anexados); por isso aparecem como \"—\". "
+                        "As demais métricas usam a curva de patrimônio operacional (bruta); Sharpe e "
+                        "Sortino anualizados por 252/horizonte períodos, taxa livre de risco = 0% "
+                        "(Selic não informada)."
+                    )
+                else:
+                    st.caption(
+                        "Beta e Alfa de Jensen calculados contra o Ibovespa enviado; taxa livre de risco "
+                        "usa a Selic real de cada período (não um valor fixo). Sharpe e Sortino "
+                        "anualizados por 252/horizonte períodos."
+                    )
+                tabela_metricas = pd.DataFrame([
+                    ("Taxa de acerto", fmt_pct(metricas["taxa_acerto"])),
+                    ("Profit factor", fmt_num(metricas["profit_factor"])),
+                    ("Sharpe", fmt_num(metricas["sharpe"])),
+                    ("Sortino", fmt_num(metricas["sortino"])),
+                    ("Calmar", fmt_num(metricas["calmar"])),
+                    ("Beta", fmt_num(metricas["beta"])),
+                    ("Alfa de Jensen (anualizado)", fmt_pct(metricas["alfa_jensen_anualizado"])),
+                    ("Drawdown absoluto", fmt_rs(metricas["drawdown_absoluto_rs"])),
+                    ("Drawdown máximo", fmt_rs(metricas["drawdown_maximo_rs"])),
+                    ("Drawdown relativo", fmt_pct(metricas["drawdown_relativo_pct"])),
+                    ("Emolumentos", fmt_rs(metricas["emolumentos"])),
+                    ("Taxas e corretagem", fmt_rs(metricas["taxas_e_corretagem"])),
+                    ("Impostos (DARF)", fmt_rs(metricas["impostos"])),
+                ], columns=["Métrica", "Valor"])
+                st.dataframe(tabela_metricas, use_container_width=True, hide_index=True)
+
+                st.subheader("Comparação: estratégia vs. Ibovespa vs. Selic (mesmo período, mesmo capital)")
+                if not comparativo:
+                    st.info(
+                        "Anexe os arquivos de Ibovespa e Selic no expansor acima e rode o backtest de "
+                        "novo para ver essa comparação."
+                    )
+                else:
+                    st.caption(
+                        "Ibovespa e Selic aqui são **brutos** (sem IR): a regra de swing trade em ações "
+                        "usada na estratégia não se aplica a fundos de índice nem a Tesouro Selic (regras "
+                        "próprias, tabela regressiva por prazo), então aplicar o mesmo cálculo de imposto "
+                        "seria inventar um número. A estratégia (linha 1) já é líquida de IR."
+                    )
+                    linhas_comp = [("Estratégia (ML)", metricas["patrimonio_final"],
+                                     metricas["resultado_liquido"],
+                                     metricas["resultado_liquido"] / metricas["capital_inicial"])]
+                    if "ibovespa" in comparativo:
+                        c = comparativo["ibovespa"]
+                        linhas_comp.append(("Ibovespa (buy & hold, bruto)", c["patrimonio_final_bruto"],
+                                             c["resultado_bruto"], c["retorno_pct"]))
+                    if "selic" in comparativo:
+                        c = comparativo["selic"]
+                        linhas_comp.append(("Selic (bruto)", c["patrimonio_final_bruto"],
+                                             c["resultado_bruto"], c["retorno_pct"]))
+                    tabela_comp = pd.DataFrame(
+                        [(nome, fmt_rs(pf), fmt_rs(res), fmt_pct(ret)) for nome, pf, res, ret in linhas_comp],
+                        columns=["Onde o capital ficou", "Patrimônio final", "Resultado", "Retorno no período"],
+                    )
+                    st.dataframe(tabela_comp, use_container_width=True, hide_index=True)
+
                 st.subheader("Resumo por período (custos operacionais já descontados, IR ainda não)")
                 st.dataframe(resumo, use_container_width=True)
 
