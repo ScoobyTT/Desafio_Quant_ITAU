@@ -375,3 +375,20 @@ if "resultado" in st.session_state:
 
                 st.subheader("Todas as operações simuladas")
                 st.dataframe(operacoes, use_container_width=True)
+
+
+
+
+
+
+
+
+#1curva = resumo[["data_decisao", "capital_apos_periodo"]].rename(columns={"capital_apos_periodo" : "Estrategia (ML)"})
+#
+#                if benchmark_retornos is not None:
+ #                   fator_ibov = (1 + pd.Series(benchmark_retornos).fillna(0).to_numpy()).cumprod()
+  #                  curva["Ibovespa"] = capital_inicial * fator_ibov
+   #             if retorno_livre_risco_periodo is not None:
+    #                fator_selic = (1 + pd.Series(retorno_livre_risco_periodo).fillna(0).to_numpy()).cumprod()
+     #               curva["Selic"] = capital_inicial * fator_selic
+      #          st.line_chart(curva.set_index("data_decisao"))
